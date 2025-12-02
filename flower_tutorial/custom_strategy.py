@@ -1,15 +1,20 @@
 import io
 import time
-from logging import INFO
+from logging import INFO, DEBUG, WARNING
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+from typing import cast
+import numpy as np
+import random
 
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Message, MetricRecord
 from flwr.common import log, logger
 from flwr.serverapp import Grid
-from flwr.serverapp.strategy import FedAdagrad, Result, Strategy
+from flwr.serverapp.strategy import FedAvg, Result, Strategy
 from flwr.serverapp.strategy.strategy_utils import log_strategy_start_info
+
+from flower_tutorial.rl_controller import RLController
 
 from flwr.common import (
     ArrayRecord,
@@ -25,26 +30,83 @@ from flwr.serverapp.strategy.strategy_utils import (
     sample_nodes
 )
 
-class CustomFedAdagrad(FedAdagrad):
+class CustomFedAvg(FedAvg):
 
     def get_qualities(
         self, server_round: int, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
-        """Configure the next round of federated training."""
-        if self.fraction_train == 0.0:
-            return []
         # Sample nodes
         num_nodes = int(len(list(grid.get_node_ids())))
-        sample_size = max(num_nodes, self.min_train_nodes)
-        node_ids, num_total = sample_nodes(grid, self.min_available_nodes, sample_size)
+        node_ids, _ = sample_nodes(grid, self.min_available_nodes, num_nodes)
         log(
-            INFO,
-            "configure_train: Sampled %s nodes (out of %s)",
-            len(node_ids),
-            len(num_total),
+            INFO, "GET QUALITIES"
         )
         # Always inject current server round
         config["server-round"] = server_round
+
+        # Construct messages
+        record = RecordDict(
+            {self.configrecord_key: config}
+        )
+        return self._construct_messages(record, node_ids, "train.quality_measurement")
+
+
+    def get_quality_matrix(
+        self,
+        replies: Iterable[Message],
+    ) -> np.ndarray:
+        """Extract quality scores from the received Messages."""
+        quality_rows: list[list[float]] = []
+        reply_contents = [msg.content for msg in replies] 
+        
+        if replies:
+            for record in reply_contents:
+                client_row: list[float] = []
+                for record_item in record.metric_records.values():
+                    for _, value in record_item.items():
+                        client_row.append(cast(float, value))
+                if client_row:
+                    quality_rows.append(client_row)
+
+        return np.array(quality_rows, dtype=np.float32)
+    
+    
+    def configure_train(
+        self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid, quality_matrix: np.ndarray, b: np.ndarray,
+    ) -> Iterable[Message]:
+        """Configure the next round of federated training."""
+        
+        # Do not configure federated train if fraction_train is 0.
+        if self.fraction_train == 0.0:
+            return []
+        
+        # Sample nodes
+        num_nodes = int(len(list(grid.get_node_ids())) * self.fraction_train)
+        sample_size = max(num_nodes, self.min_train_nodes)
+                          
+        #Filter clients by threshold
+        eligible_indices = np.where(np.all(quality_matrix >= b, axis=1))[0]
+        
+        if len(eligible_indices) == 0 or len(eligible_indices) < sample_size:
+            self.last_selected_clients = []
+            log(WARNING, "No clients passed the threshold.")
+            return []
+        
+        node_ids = random.sample([list(grid.get_node_ids())[i] for i in eligible_indices], sample_size)
+
+        #node_ids, num_total = sample_nodes(grid, self.min_available_nodes, sample_size)
+        log(INFO,
+            "configure_train: Sampled %s nodes (IDs: %s) out of %s eligible (%s total connected).",
+            len(node_ids),
+            node_ids,
+            len(eligible_indices),
+            len(list(grid.get_node_ids())),
+        )
+        # Always inject current server round
+        config["server-round"] = server_round
+        
+        # Keep track of last selected clients for RL reward computation
+        self.last_selected_clients = node_ids
 
         # Construct messages
         record = RecordDict(
@@ -53,8 +115,7 @@ class CustomFedAdagrad(FedAdagrad):
         return self._construct_messages(record, node_ids, MessageType.TRAIN)
 
 
-
-
+    
     def start(
         self,
         grid: Grid,
@@ -126,7 +187,6 @@ class CustomFedAdagrad(FedAdagrad):
         for current_round in range(0, num_rounds + 1):
             
             if current_round == 0:
-                ######TODO######
                 #ask for quality scores once before training rounds
                 quality_replies = grid.send_and_receive(
                     messages=self.get_qualities(
@@ -135,11 +195,41 @@ class CustomFedAdagrad(FedAdagrad):
                         grid,
                     ),
                     timeout=timeout,
-                )            
+                )
+                   
+                # Aggregate quality metrics
+                quality_matrix = self.get_quality_matrix(quality_replies,)
+                log(INFO, "\t!!Clients Quality Metric: %s", quality_matrix)   
+                
+                #initialize RL controller
+                
+                max_clients = len(grid.get_node_ids())      # number of clients in system
+                num_metrics = quality_matrix.shape[1]      # columns in quality_matrix
+
+                rl_agent = RLController(
+                    num_metrics=num_metrics, max_clients=max_clients, beta1=1.0, beta2=0.05, beta3=0.05,
+                    lr = train_config["lr"], 
+                    )
+                      
                 continue
             
+            
+                        
             log(INFO, "")
             log(INFO, "[ROUND %s/%s]", current_round, num_rounds)
+            
+            #C, b = rl_agent.decide(quality_matrix)
+            
+            C, b = rl_agent.decide(
+                quality_matrix,
+                min_clients=2,
+                max_clients=max_clients
+            )
+            self.fraction_train = C / quality_matrix.shape[0]
+            
+            log(INFO, f"RL selected {self.fraction_train} clients")
+            log(INFO, f"RL threshold vector: {b}")
+
 
             # -----------------------------------------------------------------
             # --- TRAINING (CLIENTAPP-SIDE) -----------------------------------
@@ -153,6 +243,8 @@ class CustomFedAdagrad(FedAdagrad):
                     arrays,
                     train_config,
                     grid,
+                    quality_matrix,
+                    b,
                 ),
                 timeout=timeout,
             )
@@ -197,6 +289,12 @@ class CustomFedAdagrad(FedAdagrad):
             if agg_evaluate_metrics is not None:
                 log(INFO, "\t└──> Aggregated MetricRecord: %s", agg_evaluate_metrics)
                 result.evaluate_metrics_clientapp[current_round] = agg_evaluate_metrics
+                
+                
+            acc_t = agg_evaluate_metrics["eval_acc"]
+            reward = rl_agent.compute_reward(acc_t, self.last_selected_clients)
+            stats = rl_agent.update()
+            log(INFO, f"RL Reward = {reward:.4f}, Stats: {stats}")
 
             # -----------------------------------------------------------------
             # --- EVALUATION (SERVERAPP-SIDE) ---------------------------------
@@ -220,3 +318,7 @@ class CustomFedAdagrad(FedAdagrad):
         log(INFO, "")
 
         return result
+    
+    
+    
+    

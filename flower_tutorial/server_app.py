@@ -6,7 +6,7 @@ from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg
 
 from flower_tutorial.task import Net
-from flower_tutorial.custom_strategy import CustomFedAdagrad
+from flower_tutorial.custom_strategy import CustomFedAvg
 
 # Create ServerApp
 app = ServerApp()
@@ -26,7 +26,7 @@ def main(grid: Grid, context: Context) -> None:
     arrays = ArrayRecord(global_model.state_dict())
 
     # Initialize FedAvg strategy
-    strategy = CustomFedAdagrad(fraction_train=fraction_train)
+    strategy = CustomFedAvg(fraction_train=fraction_train)
     #strategy = FedAvg(fraction_train=fraction_train)
 
     # Start strategy, run FedAvg for `num_rounds`

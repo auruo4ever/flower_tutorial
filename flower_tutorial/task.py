@@ -9,10 +9,10 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, Normalize, ToTensor
 from flower_tutorial.custom_partitioner import NonIIDPartitioner
 from flower_tutorial.custom_incompleteness import make_incomplete_dataset
+from flower_tutorial.custom_incompleteness import make_inaccurate_dataset
 from flwr_datasets.partitioner import DirichletPartitioner
 from collections import Counter
 
-log_path = "all_clients_distribution.txt"
 
 
 class Net(nn.Module):
@@ -69,7 +69,8 @@ def load_data(partition_id: int, num_partitions: int):
         
     partition = fds.load_partition(partition_id)
 
-    partition, pct = make_incomplete_dataset(partition, min_pct=0.0, max_pct=0.4, seed=42 + partition_id)
+    partition, incomplete_prct = make_incomplete_dataset(partition, min_pct=0.0, max_pct=0.1, seed=42 + partition_id)
+    partition, inaccurate_prct = make_inaccurate_dataset(partition, min_pct=0.0, max_pct=0.1, num_classes=10, seed=42 + partition_id)
 
     # Divide data on each node: 80% train, 20% test
     partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
@@ -77,22 +78,8 @@ def load_data(partition_id: int, num_partitions: int):
     partition_train_test = partition_train_test.with_transform(apply_transforms)
     trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
     testloader = DataLoader(partition_train_test["test"], batch_size=32)
-    
-    
-    ###########################
-    dataset_to_log = partition  
-    labels = [item["label"] for item in dataset_to_log] 
-
-    label_counts = Counter(labels)
-
-    with open(log_path, "a") as f:
-        f.write(f"Client {partition_id} label distribution:\n")
-        for label, count in sorted(label_counts.items()):
-            f.write(f"  Label {label}: {count}\n")
-        f.write(f"Client {partition_id} whitened {pct*100:.2f}% of its images\n")
-    ###########################
                 
-    return trainloader, testloader
+    return trainloader, testloader, [incomplete_prct, inaccurate_prct]
 
 
 def train(net, trainloader, epochs, lr, device):
